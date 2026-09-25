@@ -14,20 +14,8 @@ clean:
 
 load: all
 	sudo insmod myblock.ko
-	@echo "--- dmesg ---"
-	@sudo dmesg | tail -n 5
 
 unload:
-	sudo rmmod myblock || true
-	@echo "--- dmesg ---"
-	@sudo dmesg | tail -n 5
+	sudo rmmod myblock 
 
 reload: unload load
-
-help:
-	@echo "Доступные цели:"
-	@echo "  all     - собрать модуль"
-	@echo "  clean   - очистить артефакты сборки"
-	@echo "  load    - загрузить модуль (insmod)"
-	@echo "  unload  - выгрузить модуль (rmmod)"
-	@echo "  reload  - unload + load"
