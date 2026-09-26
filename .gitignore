@@ -6,3 +6,4 @@
 *.order
 .tmp_versions/
 .*.cmd
+test_ioctl
