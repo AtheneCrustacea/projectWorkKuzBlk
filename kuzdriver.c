@@ -1,3 +1,4 @@
+#include <crypto/skcipher.h>
 #include <linux/atomic.h>
 #include <linux/bio.h>
 #include <linux/blkdev.h>
@@ -7,11 +8,12 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/scatterlist.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/vmalloc.h>
 
-#include "./kuzdriver_ioctl.h"
+#include "kuzdriver_ioctl.h"
 
 #define DRIVER_NAME "KuzDriver"
 #define DEVICE_NAME "KuzEncDev"
@@ -21,10 +23,13 @@
 #define PARTITION_SIZE_BYTES (PARTITION_SIZE_MB * 1024ULL * 1024ULL)
 #define PARTITION_SIZE_SECT (PARTITION_SIZE_BYTES / 512)
 
+#define KUZ_IV_SIZE 16 // key size in bytes
+
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("H8SM");
-MODULE_DESCRIPTION("Block device driver");
-MODULE_VERSION("0.5");
+MODULE_DESCRIPTION(
+    "Block device driver with transparent Kuznyechik CTR encryption");
+MODULE_VERSION("0.6");
 
 struct myblock_device {
   struct gendisk *gd;
@@ -40,6 +45,9 @@ struct myblock_device {
   atomic64_t writes;
   atomic64_t bytes_read;
   atomic64_t bytes_written;
+  // crypto
+  struct crypto_skcipher *tfm;
+  atomic_t crypto_enabled;
 };
 
 static struct myblock_device *mydevs[NUM_PARTITIONS];
@@ -56,11 +64,85 @@ static void myblock_release(struct gendisk *disk) {
   pr_info(DRIVER_NAME ": %s closed\n", disk->disk_name);
 }
 
+// crypto stuff
+static struct scatterlist *myblock_sg_from_vmalloc(void *buf, size_t len,
+                                                   int *nents_out) {
+  struct scatterlist *sg;
+  unsigned long addr = (unsigned long)buf;
+  unsigned long offset = offset_in_page(addr);
+  size_t remaining = len;
+  int nents = DIV_ROUND_UP(offset + len, PAGE_SIZE);
+  int i;
+
+  sg = kmalloc_array(nents, sizeof(*sg), GFP_KERNEL);
+  if (!sg)
+    return NULL;
+
+  sg_init_table(sg, nents);
+
+  for (i = 0; i < nents; i++) {
+    struct page *page = vmalloc_to_page((void *)addr);
+    size_t seg_len = min_t(size_t, PAGE_SIZE - offset, remaining);
+
+    if (!page) {
+      kfree(sg);
+      return NULL;
+    }
+    sg_set_page(&sg[i], page, seg_len, offset);
+    addr += seg_len;
+    remaining -= seg_len;
+    offset = 0;
+  }
+
+  *nents_out = nents;
+  return sg;
+}
+
+// encryption itself
+static int myblock_crypt_data(struct myblock_device *dev, u64 sector, void *buf,
+                              size_t len, bool encrypt) {
+  struct scatterlist *sg;
+  struct skcipher_request *req;
+  u8 iv[KUZ_IV_SIZE] = {0};
+  int nents, ret;
+
+  sg = myblock_sg_from_vmalloc(buf, len, &nents);
+  if (!sg) {
+    pr_err(DRIVER_NAME ": %s: failed to build sg list\n", dev->gd->disk_name);
+    return -ENOMEM;
+  }
+
+  req = skcipher_request_alloc(dev->tfm, GFP_KERNEL);
+  if (!req) {
+    kfree(sg);
+    return -ENOMEM;
+  }
+
+  *(__le64 *)iv = cpu_to_le64(sector);
+
+  skcipher_request_set_crypt(req, sg, sg, len, iv);
+
+  if (encrypt)
+    ret = crypto_skcipher_encrypt(req);
+  else
+    ret = crypto_skcipher_decrypt(req);
+
+  skcipher_request_free(req);
+  kfree(sg);
+
+  if (ret)
+    pr_err(DRIVER_NAME ": crypto_skcipher_%s failed: %d\n",
+           encrypt ? "encrypt" : "decrypt", ret);
+
+  return ret;
+}
+
 static void myblock_submit_bio(struct bio *bio) {
   struct myblock_device *dev = bio->bi_bdev->bd_disk->private_data;
   struct bvec_iter iter;
   struct bio_vec bvec;
   bool is_write = (bio_op(bio) == REQ_OP_WRITE);
+  bool do_crypt = dev->key_set && atomic_read(&dev->crypto_enabled);
 
   if (atomic_read(&dev->locked)) {
     pr_info(DRIVER_NAME ": %s: I/O on locked device\n", dev->gd->disk_name);
@@ -78,21 +160,48 @@ static void myblock_submit_bio(struct bio *bio) {
     void *iovec_mem;
     unsigned int len = bvec.bv_len;
     unsigned int dev_offset = iter.bi_sector * 512;
-
-    iovec_mem = kmap_local_page(bvec.bv_page);
-    if (!iovec_mem) {
-      pr_err(DRIVER_NAME ": kmap failed\n");
-      bio_io_error(bio);
-      return;
-    }
-    iovec_mem += bvec.bv_offset;
-
-    if (is_write)
+    int ret;
+    if (is_write) {
+      iovec_mem = kmap_local_page(bvec.bv_page);
+      if (!iovec_mem) {
+        bio_io_error(bio);
+        return;
+      }
+      iovec_mem += bvec.bv_offset;
       memcpy(dev->data + dev_offset, iovec_mem, len);
-    else
-      memcpy(iovec_mem, dev->data + dev_offset, len);
+      kunmap_local(iovec_mem - bvec.bv_offset);
 
-    kunmap_local(iovec_mem - bvec.bv_offset);
+      if (dev->key_set) {
+        if (do_crypt) {
+          ret = myblock_crypt_data(dev, iter.bi_sector, dev->data + dev_offset,
+                                   len, true);
+          if (ret) {
+            bio_io_error(bio);
+            return;
+          }
+        }
+      }
+    } else {
+      if (dev->key_set) {
+        if (do_crypt) {
+          ret = myblock_crypt_data(dev, iter.bi_sector, dev->data + dev_offset,
+                                   len, false);
+          if (ret) {
+            bio_io_error(bio);
+            return;
+          }
+        }
+      }
+
+      iovec_mem = kmap_local_page(bvec.bv_page);
+      if (!iovec_mem) {
+        bio_io_error(bio);
+        return;
+      }
+      iovec_mem += bvec.bv_offset;
+      memcpy(iovec_mem, dev->data + dev_offset, len);
+      kunmap_local(iovec_mem - bvec.bv_offset);
+    }
   }
 
   if (is_write) {
@@ -106,6 +215,8 @@ static void myblock_submit_bio(struct bio *bio) {
   bio_endio(bio);
 }
 
+// ioctl
+
 static int myblock_ioctl(struct block_device *bdev, blk_mode_t mode,
                          unsigned int cmd, unsigned long arg) {
   struct myblock_device *dev = bdev->bd_disk->private_data;
@@ -114,11 +225,18 @@ static int myblock_ioctl(struct block_device *bdev, blk_mode_t mode,
   switch (cmd) {
   case MYBLOCK_IOCTL_SET_KEY: {
     struct myblock_key k;
+    int ret;
 
     if (copy_from_user(&k, argp, sizeof(k)))
       return -EFAULT;
 
     mutex_lock(&dev->key_lock);
+    ret = crypto_skcipher_setkey(dev->tfm, k.key, 32);
+    if (ret) {
+      mutex_unlock(&dev->key_lock);
+      pr_err(DRIVER_NAME ": setkey failed: %d\n", ret);
+      return ret;
+    }
     memcpy(dev->key, k.key, sizeof(dev->key));
     dev->key_set = true;
     mutex_unlock(&dev->key_lock);
@@ -134,6 +252,7 @@ static int myblock_ioctl(struct block_device *bdev, blk_mode_t mode,
 
   case MYBLOCK_IOCTL_UNLOCK:
     atomic_set(&dev->locked, 0);
+    atomic_set(&dev->crypto_enabled, 1);
     pr_info(DRIVER_NAME ": %s: unlocked\n", dev->gd->disk_name);
     return 0;
 
@@ -146,6 +265,7 @@ static int myblock_ioctl(struct block_device *bdev, blk_mode_t mode,
     st.writes = atomic64_read(&dev->writes);
     st.bytes_read = atomic64_read(&dev->bytes_read);
     st.bytes_written = atomic64_read(&dev->bytes_written);
+    st.crypto_enabled = atomic_read(&dev->crypto_enabled) ? 1 : 0;
 
     mutex_lock(&dev->key_lock);
     st.key_set = dev->key_set ? 1 : 0;
@@ -155,7 +275,15 @@ static int myblock_ioctl(struct block_device *bdev, blk_mode_t mode,
       return -EFAULT;
     return 0;
   }
+  case MYBLOCK_IOCTL_ENABLE_CRYPTO:
+    atomic_set(&dev->crypto_enabled, 1);
+    pr_info(DRIVER_NAME ": %s: crypto enabled\n", dev->gd->disk_name);
+    return 0;
 
+  case MYBLOCK_IOCTL_DISABLE_CRYPTO:
+    atomic_set(&dev->crypto_enabled, 0);
+    pr_info(DRIVER_NAME ": %s: crypto disabled\n", dev->gd->disk_name);
+    return 0;
   default:
     return -ENOTTY;
   }
@@ -169,7 +297,7 @@ static const struct block_device_operations myblock_fops = {
     .ioctl = myblock_ioctl,
 };
 
-// free single dev
+// free single device
 
 static void myblock_free_device(struct myblock_device *dev, bool disk_added) {
   if (!dev)
@@ -180,6 +308,8 @@ static void myblock_free_device(struct myblock_device *dev, bool disk_added) {
       del_gendisk(dev->gd);
     put_disk(dev->gd);
   }
+  if (dev->tfm)
+    crypto_free_skcipher(dev->tfm);
   if (dev->data)
     vfree(dev->data);
 
@@ -187,6 +317,7 @@ static void myblock_free_device(struct myblock_device *dev, bool disk_added) {
   memzero_explicit(
       dev->key,
       sizeof(dev->key)); // it should be RND'ed, but i'm not sertifying this
+  mutex_destroy(&dev->key_lock);
   kfree(dev);
 }
 
@@ -219,7 +350,6 @@ static int __init myblock_init(void) {
     }
     dev->index = i;
 
-    /* Инициализация состояния и статистики */
     atomic_set(&dev->locked, 0);
     atomic64_set(&dev->reads, 0);
     atomic64_set(&dev->writes, 0);
@@ -230,6 +360,7 @@ static int __init myblock_init(void) {
 
     dev->data = vmalloc(PARTITION_SIZE_BYTES);
     if (!dev->data) {
+      pr_err(DRIVER_NAME ": vmalloc failed for %d\n", i);
       mutex_destroy(&dev->key_lock);
       kfree(dev);
       ret = -ENOMEM;
@@ -237,13 +368,26 @@ static int __init myblock_init(void) {
     }
     memset(dev->data, 0, PARTITION_SIZE_BYTES);
 
+    dev->tfm = crypto_alloc_skcipher("ctr(kuznyechik)", 0, 0);
+    if (IS_ERR(dev->tfm)) {
+      ret = PTR_ERR(dev->tfm);
+      pr_err(DRIVER_NAME ": crypto_alloc_skcipher failed: %d\n", ret);
+      dev->tfm = NULL;
+      vfree(dev->data);
+      mutex_destroy(&dev->key_lock);
+      kfree(dev);
+      goto err_cleanup;
+    }
+    pr_info(DRIVER_NAME ": [%d] crypto tfm created (ivsize=%u)\n", i,
+            crypto_skcipher_ivsize(dev->tfm));
+
     dev->gd = blk_alloc_disk(&lim, NUMA_NO_NODE);
     if (IS_ERR(dev->gd)) {
       mutex_destroy(&dev->key_lock);
       ret = PTR_ERR(dev->gd);
       pr_err(DRIVER_NAME ": blk_alloc_disk failed: %d\n", ret);
-      vfree(dev->data);
-      kfree(dev);
+      dev->gd = NULL;
+      myblock_free_device(dev, false);
       goto err_cleanup;
     }
 
