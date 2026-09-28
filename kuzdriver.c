@@ -8,7 +8,9 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/proc_fs.h>
 #include <linux/scatterlist.h>
+#include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/vmalloc.h>
@@ -23,13 +25,13 @@
 #define PARTITION_SIZE_BYTES (PARTITION_SIZE_MB * 1024ULL * 1024ULL)
 #define PARTITION_SIZE_SECT (PARTITION_SIZE_BYTES / 512)
 
-#define KUZ_IV_SIZE 16 // key size in bytes
+#define KUZ_IV_SIZE 16 // block size in bytes
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("H8SM");
 MODULE_DESCRIPTION(
     "Block device driver with transparent Kuznyechik CTR encryption");
-MODULE_VERSION("0.6");
+MODULE_VERSION("0.7");
 
 struct myblock_device {
   struct gendisk *gd;
@@ -289,6 +291,57 @@ static int myblock_ioctl(struct block_device *bdev, blk_mode_t mode,
   }
 }
 
+// procfs
+
+static void kuzdriver_dump_buffer(struct seq_file *m,
+                                  struct myblock_device *dev) {
+  int i;
+  seq_puts(m, "  buffer[0..31]: ");
+  for (i = 0; i < 32; i++)
+    seq_printf(m, "%02x",
+               dev->data[i]); // TODO: make some spinlock or something
+  seq_puts(m, "\n");
+}
+
+static int kuzdriver_proc_show(struct seq_file *m, void *v) {
+  int i;
+
+  seq_puts(m, "KuzDriver status\n");
+  seq_puts(m, "================\n\n");
+
+  for (i = 0; i < NUM_PARTITIONS; i++) {
+    struct myblock_device *dev = mydevs[i];
+    bool key_set;
+
+    if (!dev)
+      continue;
+
+    mutex_lock(&dev->key_lock);
+    key_set = dev->key_set;
+    mutex_unlock(&dev->key_lock);
+
+    seq_printf(m, "partition %d: /dev/%s\n", i, dev->gd->disk_name);
+    seq_printf(m, "  capacity:       %u MiB\n", PARTITION_SIZE_MB);
+    seq_printf(m, "  locked:         %s\n",
+               atomic_read(&dev->locked) ? "yes" : "no");
+    seq_printf(m, "  key_set:        %s\n", key_set ? "yes" : "no");
+    seq_printf(m, "  crypto_enabled: %s\n",
+               atomic_read(&dev->crypto_enabled) ? "yes" : "no");
+    seq_printf(m, "  reads:          %llu\n",
+               (unsigned long long)atomic64_read(&dev->reads));
+    seq_printf(m, "  writes:         %llu\n",
+               (unsigned long long)atomic64_read(&dev->writes));
+    seq_printf(m, "  bytes_read:     %llu\n",
+               (unsigned long long)atomic64_read(&dev->bytes_read));
+    seq_printf(m, "  bytes_written:  %llu\n",
+               (unsigned long long)atomic64_read(&dev->bytes_written));
+
+    kuzdriver_dump_buffer(m, dev);
+    seq_puts(m, "\n");
+  }
+  return 0;
+}
+
 static const struct block_device_operations myblock_fops = {
     .owner = THIS_MODULE,
     .open = myblock_open,
@@ -313,10 +366,9 @@ static void myblock_free_device(struct myblock_device *dev, bool disk_added) {
   if (dev->data)
     vfree(dev->data);
 
-  mutex_destroy(&dev->key_lock);
   memzero_explicit(
       dev->key,
-      sizeof(dev->key)); // it should be RND'ed, but i'm not sertifying this
+      sizeof(dev->key)); // it should be RND'ed, but i'm not certifying this
   mutex_destroy(&dev->key_lock);
   kfree(dev);
 }
@@ -383,7 +435,6 @@ static int __init myblock_init(void) {
 
     dev->gd = blk_alloc_disk(&lim, NUMA_NO_NODE);
     if (IS_ERR(dev->gd)) {
-      mutex_destroy(&dev->key_lock);
       ret = PTR_ERR(dev->gd);
       pr_err(DRIVER_NAME ": blk_alloc_disk failed: %d\n", ret);
       dev->gd = NULL;
@@ -411,10 +462,18 @@ static int __init myblock_init(void) {
     pr_info(DRIVER_NAME ": /dev/%s registered\n", dev->gd->disk_name);
   }
 
+  if (!proc_create_single("kuzdriver", 0444, NULL, kuzdriver_proc_show)) {
+    pr_err(DRIVER_NAME ": failed to create /proc/kuzdriver\n");
+    ret = -ENOMEM;
+    goto err_cleanup;
+  }
+  pr_info(DRIVER_NAME ": /proc/kuzdriver created\n");
+
   pr_info(DRIVER_NAME ": all %d partitions registered\n", NUM_PARTITIONS);
   return 0;
 
 err_cleanup:
+  remove_proc_entry("kuzdriver", NULL); // will be fine even if there is no file
   for (i = 0; i < NUM_PARTITIONS; i++) {
     if (mydevs[i]) {
       myblock_free_device(mydevs[i], true);
@@ -435,6 +494,7 @@ static void __exit myblock_exit(void) {
       mydevs[i] = NULL;
     }
   }
+  remove_proc_entry("kuzdriver", NULL);
   unregister_blkdev(major_number, DEVICE_NAME);
   pr_info(DRIVER_NAME ": unloaded\n");
 }

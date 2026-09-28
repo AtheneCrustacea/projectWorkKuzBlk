@@ -25,10 +25,12 @@ clean:
 	rm -f test_ioctl
 
 load: module
+	sudo insmod ~/kuz-build/kuznyechik_generic.ko
 	sudo insmod $(DRV_NAME).ko
 
 unload:
 	sudo rmmod $(DRV_NAME).ko
+	sudo rmmod kuznyechik_generic.ko
 
 reload: unload load
 
