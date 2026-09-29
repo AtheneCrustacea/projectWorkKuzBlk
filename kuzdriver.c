@@ -2,10 +2,12 @@
 #include <linux/atomic.h>
 #include <linux/bio.h>
 #include <linux/blkdev.h>
+#include <linux/device.h>
 #include <linux/errno.h>
 #include <linux/fs.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
+#include <linux/kobject.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/proc_fs.h>
@@ -31,7 +33,7 @@ MODULE_LICENSE("GPL");
 MODULE_AUTHOR("H8SM");
 MODULE_DESCRIPTION(
     "Block device driver with transparent Kuznyechik CTR encryption");
-MODULE_VERSION("0.7");
+MODULE_VERSION("0.8");
 
 struct myblock_device {
   struct gendisk *gd;
@@ -47,6 +49,8 @@ struct myblock_device {
   atomic64_t writes;
   atomic64_t bytes_read;
   atomic64_t bytes_written;
+  // sysfs
+  struct device *sysfs_dev;
   // crypto
   struct crypto_skcipher *tfm;
   atomic_t crypto_enabled;
@@ -54,6 +58,7 @@ struct myblock_device {
 
 static struct myblock_device *mydevs[NUM_PARTITIONS];
 static int major_number;
+static struct class *kuzdriver_class;
 
 // block_device_operations
 
@@ -342,6 +347,122 @@ static int kuzdriver_proc_show(struct seq_file *m, void *v) {
   return 0;
 }
 
+// sysfs stuff
+
+static ssize_t size_show(struct device *d, struct device_attribute *attr,
+                         char *buf) {
+  // struct myblock_device *dev = dev_get_drvdata(d);
+  return sysfs_emit(buf, "%llu\n", (unsigned long long)PARTITION_SIZE_BYTES);
+}
+
+static ssize_t locked_show(struct device *d, struct device_attribute *attr,
+                           char *buf) {
+  struct myblock_device *dev = dev_get_drvdata(d);
+  return sysfs_emit(buf, "%d\n", atomic_read(&dev->locked) ? 1 : 0);
+}
+
+static ssize_t locked_store(struct device *d, struct device_attribute *attr,
+                            const char *buf, size_t count) {
+  struct myblock_device *dev = dev_get_drvdata(d);
+  unsigned long val;
+
+  if (kstrtoul(buf, 10, &val))
+    return -EINVAL;
+  atomic_set(&dev->locked, val ? 1 : 0);
+  pr_info(DRIVER_NAME ": %s: locked=%lu via sysfs\n", dev->gd->disk_name, val);
+  return count;
+}
+
+static ssize_t key_set_show(struct device *d, struct device_attribute *attr,
+                            char *buf) {
+  struct myblock_device *dev = dev_get_drvdata(d);
+  bool key_set;
+
+  mutex_lock(&dev->key_lock);
+  key_set = dev->key_set;
+  mutex_unlock(&dev->key_lock);
+
+  return sysfs_emit(buf, "%d\n", key_set ? 1 : 0);
+}
+
+static ssize_t crypto_enabled_show(struct device *d,
+                                   struct device_attribute *attr, char *buf) {
+  struct myblock_device *dev = dev_get_drvdata(d);
+  return sysfs_emit(buf, "%d\n", atomic_read(&dev->crypto_enabled) ? 1 : 0);
+}
+
+static ssize_t crypto_enabled_store(struct device *d,
+                                    struct device_attribute *attr,
+                                    const char *buf, size_t count) {
+  struct myblock_device *dev = dev_get_drvdata(d);
+  unsigned long val;
+
+  if (kstrtoul(buf, 10, &val))
+    return -EINVAL;
+  atomic_set(&dev->crypto_enabled, val ? 1 : 0);
+  pr_info(DRIVER_NAME ": %s: crypto_enabled=%lu via sysfs\n",
+          dev->gd->disk_name, val);
+  return count;
+}
+
+static ssize_t reads_show(struct device *d, struct device_attribute *attr,
+                          char *buf) {
+  struct myblock_device *dev = dev_get_drvdata(d);
+  return sysfs_emit(buf, "%llu\n",
+                    (unsigned long long)atomic64_read(&dev->reads));
+}
+
+static ssize_t writes_show(struct device *d, struct device_attribute *attr,
+                           char *buf) {
+  struct myblock_device *dev = dev_get_drvdata(d);
+  return sysfs_emit(buf, "%llu\n",
+                    (unsigned long long)atomic64_read(&dev->writes));
+}
+
+static ssize_t bytes_read_show(struct device *d, struct device_attribute *attr,
+                               char *buf) {
+  struct myblock_device *dev = dev_get_drvdata(d);
+  return sysfs_emit(buf, "%llu\n",
+                    (unsigned long long)atomic64_read(&dev->bytes_read));
+}
+
+static ssize_t bytes_written_show(struct device *d,
+                                  struct device_attribute *attr, char *buf) {
+  struct myblock_device *dev = dev_get_drvdata(d);
+  return sysfs_emit(buf, "%llu\n",
+                    (unsigned long long)atomic64_read(&dev->bytes_written));
+}
+
+static DEVICE_ATTR_RO(size);
+static DEVICE_ATTR_RW(locked);
+static DEVICE_ATTR_RO(key_set);
+static DEVICE_ATTR_RW(crypto_enabled);
+static DEVICE_ATTR_RO(reads);
+static DEVICE_ATTR_RO(writes);
+static DEVICE_ATTR_RO(bytes_read);
+static DEVICE_ATTR_RO(bytes_written);
+
+static struct attribute *kuzdriver_attrs[] = {
+    &dev_attr_size.attr,
+    &dev_attr_locked.attr,
+    &dev_attr_key_set.attr,
+    &dev_attr_crypto_enabled.attr,
+    &dev_attr_reads.attr,
+    &dev_attr_writes.attr,
+    &dev_attr_bytes_read.attr,
+    &dev_attr_bytes_written.attr,
+    NULL,
+};
+
+static const struct attribute_group kuzdriver_attr_group = {
+    .attrs = kuzdriver_attrs,
+};
+
+static const struct attribute_group *kuzdriver_attr_groups[] = {
+    &kuzdriver_attr_group,
+    NULL,
+};
+
 static const struct block_device_operations myblock_fops = {
     .owner = THIS_MODULE,
     .open = myblock_open,
@@ -355,6 +476,11 @@ static const struct block_device_operations myblock_fops = {
 static void myblock_free_device(struct myblock_device *dev, bool disk_added) {
   if (!dev)
     return;
+
+  if (dev->sysfs_dev) {
+    device_destroy(kuzdriver_class, dev->sysfs_dev->devt);
+    dev->sysfs_dev = NULL;
+  }
 
   if (dev->gd) {
     if (disk_added)
@@ -387,6 +513,14 @@ static int __init myblock_init(void) {
     return major_number;
   }
   pr_info(DRIVER_NAME ": major=%d\n", major_number);
+
+  kuzdriver_class = class_create("kuzdriver");
+  if (IS_ERR(kuzdriver_class)) {
+    ret = PTR_ERR(kuzdriver_class);
+    kuzdriver_class = NULL;
+    pr_err(DRIVER_NAME ": class_create failed: %d\n", ret);
+    goto err_cleanup;
+  }
 
   for (i = 0; i < NUM_PARTITIONS; i++) {
     struct myblock_device *dev;
@@ -452,6 +586,17 @@ static int __init myblock_init(void) {
     set_capacity(dev->gd, PARTITION_SIZE_SECT);
 
     ret = add_disk(dev->gd);
+    dev->sysfs_dev = device_create_with_groups(
+        kuzdriver_class, NULL, MKDEV(0, 0), dev, kuzdriver_attr_groups, "%s%d",
+        DEVICE_NAME, i);
+    if (IS_ERR(dev->sysfs_dev)) {
+      ret = PTR_ERR(dev->sysfs_dev);
+      pr_err(DRIVER_NAME ": device_create failed: %d\n", ret);
+      dev->sysfs_dev = NULL;
+      myblock_free_device(dev, true);
+      mydevs[i] = NULL;
+      goto err_cleanup;
+    }
     if (ret) {
       pr_err(DRIVER_NAME ": add_disk failed: %d\n", ret);
       myblock_free_device(dev, false);
@@ -481,6 +626,9 @@ err_cleanup:
     }
   }
   unregister_blkdev(major_number, DEVICE_NAME);
+  if (kuzdriver_class) {
+    class_destroy(kuzdriver_class);
+  }
   return ret;
 }
 
@@ -495,6 +643,9 @@ static void __exit myblock_exit(void) {
     }
   }
   remove_proc_entry("kuzdriver", NULL);
+  if (kuzdriver_class) {
+    class_destroy(kuzdriver_class);
+  }
   unregister_blkdev(major_number, DEVICE_NAME);
   pr_info(DRIVER_NAME ": unloaded\n");
 }
