@@ -1,0 +1,132 @@
+KuzDriver
+
+Блочный драйвер Linux с прозрачным шифрованием данных
+по ГОСТ Р 34.12-2015 («Кузнечик») в режиме CTR.
+
+Создаёт блочное устройство `/dev/KuzEncDev` размером ~301 МиБ
+с тремя разделами по 100 МиБ:
+    KuzEncDev    251:0    0  301M  0 disk 
+    ├─KuzEncDev1 251:1    0  100M  0 part 
+    ├─KuzEncDev2 251:2    0  100M  0 part 
+    └─KuzEncDev3 251:3    0  100M  0 part 
+
+Таблица разделов (MBR) записывается драйвером в начало буфера при
+загрузке, поэтому ядро автоматически создаёт разделы через обычный
+парсер.
+
+Если ключ для раздела не установлен или криптография отключена,
+раздел работает как обычный RAM-диск (данные в открытом виде).
+
+Установка модуля шифрования
+
+Для реализации криптографии используется модуль kuznyechik_generic из `gost-crypto-dkms` (целиком не собрался)
+
+
+Сборка и загрузка драйвера
+
+    make            
+    sudo make load  
+    sudo make unload
+
+После загрузки появятся:
+
+    /dev/KuzEncDev, /dev/KuzEncDev1..3
+    /proc/kuzdriver
+    /sys/class/kuzdriver/KuzEncDev/
+    /sys/class/kuzdriver/KuzEncDev/KuzEncDev1..3/
+
+Используемые инструменты:
+
+Ядро:
+- `blk_alloc_disk`, `add_disk`, `del_gendisk`, `put_disk` — регистрация
+  блочного устройства и его разделов
+- `submit_bio` в `block_device_operations` — обработка I/O
+- `bio_for_each_segment`, `kmap_local_page` — bio
+- `proc_create_single`, `seq_file` —  /proc`
+- `class_create`, `device_create_with_groups`, `kobject_add` — `/sys`
+- `Crypto API` — шифрование
+
+Userspace:
+- `test_ioctl` — утилита управления через ioctl
+- `dd`, `mkfs.ext4`, `mount` — стандартные инструменты для тестов
+
+## API: ioctl-команды
+
+Вызываются на открытом файле устройства. MAGIC-байт — `'K'`.
+Команды можно применять как к разделу (`/dev/KuzEncDev1`), так и ко
+всему диску (`/dev/KuzEncDev`) — во втором случае операция применяется
+ко всем трём разделам сразу.
+
+| Команда                        | Код      | Описание                              |
+|--------------------------------|----------|---------------------------------------|
+| `MYBLOCK_IOCTL_SET_KEY`        | `'K', 1` | Установить 256-битный ключ шифрования |
+| `MYBLOCK_IOCTL_LOCK`           | `'K', 2` | Заблокировать раздел(ы)               |
+| `MYBLOCK_IOCTL_UNLOCK`         | `'K', 3` | Разблокировать                        |
+| `MYBLOCK_IOCTL_GET_STATUS`     | `'K', 4` | Получить статус и счётчики            |
+| `MYBLOCK_IOCTL_ENABLE_CRYPTO`  | `'K', 5` | Включить шифрование                   |
+| `MYBLOCK_IOCTL_DISABLE_CRYPTO` | `'K', 6` | Выключить шифрование                  |
+
+**Пример через test_ioctl:**
+
+    sudo ./test_ioctl /dev/KuzEncDev1 setkey      # ключ по умолчанию
+    sudo ./test_ioctl /dev/KuzEncDev1 crypto-on
+    sudo ./test_ioctl /dev/KuzEncDev1 status
+
+**Пример через dd:**
+
+    echo "secret data" | sudo tee /dev/KuzEncDev1
+    sudo dd if=/dev/KuzEncDev1 bs=512 count=1 2>/dev/null
+
+## Интерфейс /proc/kuzdriver
+
+RO, показывает состояние всего диска и каждого раздела:
+
+    cat /proc/kuzdriver
+
+## Интерфейс /sys/class/kuzdriver/
+
+**Атрибуты всего диска** в `/sys/class/kuzdriver/KuzEncDev/`:
+
+| Файл       | Режим | Описание                              |
+|------------|-------|---------------------------------------|
+| `size`     | 0444  | Размер всего диска в байтах           |
+| `locked`   | 0644  | 1 = все разделы заблокированы         |
+
+`locked` можно выставлять: `echo 1 > .../KuzEncDev/locked`.
+
+**Атрибуты раздела** в `/sys/class/kuzdriver/KuzEncDev/KuzEncDev\d/`:
+
+| Файл              | Режим | Описание                              |
+|-------------------|-------|---------------------------------------|
+| `size`            | 0444  | Размер раздела в байтах               |
+| `start`           | 0444  | Начальный сектор                      |
+| `locked`          | 0644  | Блокировка раздела                    |
+| `key_set`         | 0444  | Установлен ли ключ                    |
+| `crypto_enabled`  | 0644  | Включено ли шифрование                |
+| `reads`, `writes` | 0444  | Счётчики операций                     |
+| `bytes_read`, `bytes_written` | 0444 | Счётчики байт              |
+
+Запись: `echo 0 > .../KuzEncDev1/locked` или
+`echo 1 > .../KuzEncDev1/crypto_enabled`.
+
+## Проверка
+
+    # 1. Установить ключ и записать данные
+    sudo ./test_ioctl /dev/KuzEncDev1 setkey
+    echo "hello" | sudo tee /dev/KuzEncDev1 > /dev/null
+
+    # 2. Прочитать обратно — должны получить "hello"
+    sudo dd if=/dev/KuzEncDev1 bs=512 count=1 2>/dev/null | head -c 5
+
+    # 3. Убедиться, что данные действительно зашифрованы
+    sudo ./test_ioctl /dev/KuzEncDev1 crypto-off
+    sudo dd if=/dev/KuzEncDev1 bs=512 count=1 2>/dev/null | xxd | head
+    # Ожидаем мусор — данные не расшифровываются
+
+    # 4. Проверка файловой системой
+    sudo ./test_ioctl /dev/KuzEncDev2 setkey
+    sudo mkfs.ext4 /dev/KuzEncDev2
+    sudo mkdir -p /mnt/enc && sudo mount /dev/KuzEncDev2 /mnt/enc
+    echo "secret file" | sudo tee /mnt/enc/secret.txt
+    cat /mnt/enc/secret.txt
+    sudo umount /mnt/enc

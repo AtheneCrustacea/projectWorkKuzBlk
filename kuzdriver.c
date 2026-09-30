@@ -14,6 +14,7 @@
 #include <linux/scatterlist.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
+#include <linux/string.h>
 #include <linux/uaccess.h>
 #include <linux/vmalloc.h>
 
@@ -43,10 +44,9 @@ MODULE_VERSION("1.0");
 struct myblock_device;
 
 struct kuz_partition {
-  struct myblock_device *dev; // back-pointer
-  int index;                  // 1..3
-  char name[32];              // KuzEncDev1
-  sector_t start_sect;        // relative to whole disk
+  int index;           // 1..3
+  char name[32];       // KuzEncDev1
+  sector_t start_sect; // relative to whole disk
   sector_t nr_sects;
 
   struct mutex key_lock;
@@ -57,22 +57,23 @@ struct kuz_partition {
   atomic64_t reads, writes, bytes_read, bytes_written;
 
   struct crypto_skcipher *tfm;
-  struct kobject kobj; // /sys/class/kuzdriver/KuzEncDev/<name> 
+  struct kobject kobj; // /sys/class/kuzdriver/KuzEncDev/<name>
+  bool sysfs_ready;
 };
 
 struct myblock_device {
   struct gendisk *gd;
   u8 *data;
   int major;
-  atomic_t locked; // whole disk lock
   struct kuz_partition parts[NUM_PARTITIONS];
   struct device *sysfs_dev; // /sys/class/kuzdriver/KuzEncDev
+  bool disk_added;
 };
 
 static struct myblock_device *mydev;
 static struct class *kuzdriver_class;
 
-// block_device_operations 
+// block_device_operations
 
 static int myblock_open(struct gendisk *disk, blk_mode_t mode) {
   pr_info(DRIVER_NAME ": %s opened\n", disk->disk_name);
@@ -166,12 +167,6 @@ static void myblock_submit_bio(struct bio *bio) {
   struct bio_vec bvec;
   bool is_write = (bio_op(bio) == REQ_OP_WRITE);
 
-  if (atomic_read(&dev->locked)) {
-    pr_info(DRIVER_NAME ": whole disk locked, I/O denied\n");
-    bio_io_error(bio);
-    return;
-  }
-
   bio_for_each_segment(bvec, bio, iter) {
     void *iovec_mem;
     unsigned int len = bvec.bv_len;
@@ -181,7 +176,8 @@ static void myblock_submit_bio(struct bio *bio) {
     bool do_crypt;
     int ret;
 
-    if (abs_sector + (len >> 9) > WHOLE_DISK_SECT) {
+    if (abs_sector + (len >> 9) >
+        WHOLE_DISK_SECT) { // ">> 9" equal to "divide by 512"
       bio_io_error(bio);
       return;
     }
@@ -309,7 +305,6 @@ static int myblock_ioctl(struct block_device *bdev, blk_mode_t mode,
     if (part) {
       atomic_set(&part->locked, 1);
     } else {
-      atomic_set(&dev->locked, 1);
       for (i = 0; i < NUM_PARTITIONS; i++)
         atomic_set(&dev->parts[i].locked, 1);
     }
@@ -319,7 +314,6 @@ static int myblock_ioctl(struct block_device *bdev, blk_mode_t mode,
     if (part) {
       atomic_set(&part->locked, 0);
     } else {
-      atomic_set(&dev->locked, 0);
       for (i = 0; i < NUM_PARTITIONS; i++)
         atomic_set(&dev->parts[i].locked, 0);
     }
@@ -358,14 +352,18 @@ static int myblock_ioctl(struct block_device *bdev, blk_mode_t mode,
       st.bytes_read = atomic64_read(&part->bytes_read);
       st.bytes_written = atomic64_read(&part->bytes_written);
     } else {
+      bool all_locked = true;
       u64 reads = 0, writes = 0, br = 0, bw = 0;
       for (i = 0; i < NUM_PARTITIONS; i++) {
         reads += atomic64_read(&dev->parts[i].reads);
         writes += atomic64_read(&dev->parts[i].writes);
         br += atomic64_read(&dev->parts[i].bytes_read);
         bw += atomic64_read(&dev->parts[i].bytes_written);
+        if (!atomic_read(&dev->parts[i].locked)) {
+          all_locked = false;
+        }
       }
-      st.locked = atomic_read(&dev->locked) ? 1 : 0;
+      st.locked = all_locked ? 1 : 0;
       st.reads = reads;
       st.writes = writes;
       st.bytes_read = br;
@@ -390,7 +388,7 @@ static const struct block_device_operations myblock_fops = {
     .ioctl = myblock_ioctl,
 };
 
-// MBR 
+// MBR
 
 static void build_mbr(u8 *sector) {
   struct mbr_entry {
@@ -434,7 +432,11 @@ static ssize_t disk_size_show(struct device *d, struct device_attribute *a,
 static ssize_t disk_locked_show(struct device *d, struct device_attribute *a,
                                 char *b) {
   struct myblock_device *dev = dev_get_drvdata(d);
-  return sysfs_emit(b, "%d\n", atomic_read(&dev->locked) ? 1 : 0);
+  int i;
+  for (i = 0; i < NUM_PARTITIONS; i++)
+    if (!atomic_read(&dev->parts[i].locked))
+      return sysfs_emit(b, "0\n");
+  return sysfs_emit(b, "1\n");
 }
 
 static ssize_t disk_locked_store(struct device *d, struct device_attribute *a,
@@ -445,7 +447,6 @@ static ssize_t disk_locked_store(struct device *d, struct device_attribute *a,
 
   if (kstrtoul(buf, 10, &val))
     return -EINVAL;
-  atomic_set(&dev->locked, val ? 1 : 0);
   for (i = 0; i < NUM_PARTITIONS; i++)
     atomic_set(&dev->parts[i].locked, val ? 1 : 0);
   return count;
@@ -471,7 +472,7 @@ static const struct attribute_group *disk_attr_groups[] = {
     NULL,
 };
 
-// sysfs: partition kobjects 
+// sysfs: partition kobjects
 
 static ssize_t part_attr_show(struct kobject *kobj, struct attribute *attr,
                               char *buf) {
@@ -533,9 +534,7 @@ static const struct sysfs_ops part_sysfs_ops = {
     .store = part_attr_store,
 };
 
-static void part_kobj_release(struct kobject *kobj) {
-  return;
-}
+static void part_kobj_release(struct kobject *kobj) { return; }
 
 static struct kobj_type part_ktype = {
     .sysfs_ops = &part_sysfs_ops,
@@ -574,8 +573,13 @@ static int kuzdriver_proc_show(struct seq_file *m, void *v) {
   seq_puts(m, "=========================================\n\n");
   seq_printf(m, "Whole disk size:  %llu bytes\n",
              (unsigned long long)WHOLE_DISK_SECT * 512);
-  seq_printf(m, "Whole disk locked: %s\n\n",
-             atomic_read(&mydev->locked) ? "yes" : "no");
+  {
+    bool all_locked = true;
+    for (i = 0; i < NUM_PARTITIONS; i++)
+      if (!atomic_read(&mydev->parts[i].locked))
+        all_locked = false;
+    seq_printf(m, "Whole disk locked: %s\n\n", all_locked ? "yes" : "no");
+  }
 
   for (i = 0; i < NUM_PARTITIONS; i++) {
     struct kuz_partition *p = &mydev->parts[i];
@@ -616,9 +620,12 @@ static void myblock_free_device(void) {
     return;
 
   if (mydev->gd) {
-    del_gendisk(mydev->gd);
+    if (mydev->disk_added) {
+      del_gendisk(mydev->gd);
+    }
     put_disk(mydev->gd);
     mydev->gd = NULL;
+    mydev->disk_added = false;
   }
 
   for (i = 0; i < NUM_PARTITIONS; i++) {
@@ -658,13 +665,10 @@ static int __init myblock_init(void) {
     return ret;
   }
 
-  atomic_set(&mydev->locked, 0);
-
   // partitions init
   for (i = 0; i < NUM_PARTITIONS; i++) {
     struct kuz_partition *p = &mydev->parts[i];
 
-    p->dev = mydev;
     p->index = i + 1;
     snprintf(p->name, sizeof(p->name), "%s%d", DEVICE_NAME, i + 1);
     p->start_sect = FIRST_PART_SECT + i * PARTITION_SIZE_SECT;
@@ -729,6 +733,7 @@ static int __init myblock_init(void) {
     mydev->gd->private_data = NULL;
     goto err_cleanup;
   }
+  mydev->disk_added = true;
 
   // sysfs init
   kuzdriver_class = class_create("kuzdriver");
@@ -766,6 +771,7 @@ static int __init myblock_init(void) {
       kobject_put(&p->kobj);
       goto err_cleanup;
     }
+    p->sysfs_ready = true;
   }
 
   if (!proc_create_single("kuzdriver", 0444, NULL, kuzdriver_proc_show)) {
@@ -782,6 +788,8 @@ err_cleanup:
   if (mydev) {
     for (i = 0; i < NUM_PARTITIONS; i++) {
       struct kuz_partition *p = &mydev->parts[i];
+      if (!p->sysfs_ready)
+        continue;
       sysfs_remove_group(&p->kobj, &part_attr_group);
       kobject_del(&p->kobj);
       kobject_put(&p->kobj);
@@ -808,6 +816,8 @@ static void __exit myblock_exit(void) {
 
     for (i = 0; i < NUM_PARTITIONS; i++) {
       struct kuz_partition *p = &mydev->parts[i];
+      if (!p->sysfs_ready)
+        continue;
       sysfs_remove_group(&p->kobj, &part_attr_group);
       kobject_del(&p->kobj);
       kobject_put(&p->kobj);

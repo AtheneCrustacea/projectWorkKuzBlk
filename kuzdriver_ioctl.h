@@ -12,8 +12,8 @@ struct myblock_key {
 };
 
 struct myblock_status {
-  __u8 locked;  // 0 = locked, 1 = unlocked
-  __u8 key_set; // 0 = key is set, 1 = key not set
+  __u8 locked;  // 1 = locked, 0 = unlocked
+  __u8 key_set; // 1 = key is set, 0 = key not set
   __u8 crypto_enabled;
   __u8 reserved[5];
   __u64 reads;         // read ops count
